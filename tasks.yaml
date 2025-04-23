@@ -1,0 +1,205 @@
+# Copyright 2024 Defense Unicorns
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Defense-Unicorns-Commercial
+
+variables:
+  - name: FIRSTNAME
+    default: Doug
+  - name: USERNAME
+    default: doug
+  - name: AGENT_VERSION
+    default: 0.1.0
+
+
+tasks:
+  - name: get-cluster-ip
+    description: Get the main interface IP address
+    actions:
+      - cmd: |
+          ./zarf tools kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'
+        setVariables:
+          - name: IP
+  - name: get-uds-admin-ip
+    description: Get the Admin gateway IP address
+    actions:
+      - cmd: |
+          ./zarf tools kubectl -n metallb-system get ipaddresspools admin-ingressgateway -o jsonpath='{.spec.addresses[0]}' | awk -F/ '{print $1}'
+
+  - name: get-uds-tenant-ip
+    description: Get the Tenant gateway IP address
+    actions:
+      - cmd: |
+          ./zarf tools kubectl -n metallb-system get ipaddresspools tenant-ingressgateway -o jsonpath='{.spec.addresses[0]}' | awk -F/ '{print $1}'
+    
+  - name: get-uds-passthrough-ip
+    description: Get the Passthrough gateway IP address
+    actions:
+      - cmd: |
+          ./zarf tools kubectl -n metallb-system get ipaddresspools passthrough-ingressgateway -o jsonpath='{.spec.addresses[0]}' | awk -F/ '{print $1}'
+
+  - name: setup-cluster
+    description: Setup the k3s cluster and prepare it to run UDS
+    actions:
+      - cmd: |
+          ./demo_setup.sh
+
+  - name: deploy-agent
+    description: Deploy the UDS remote agent
+    actions:
+      - cmd: |
+          if [ ! -f agent/zarf-package-uds-remote-agent-$MARU_ARCH-$AGENT_VERSION.tar.zst ]; then
+            printf "\n\n\033[41;30m ERROR: Unable to deploy UDS Remote Agent\nzarf package is missing, add package and certs to the agent directory \033[0m\n\n"
+            exit 1
+          fi
+          if ! uds zarf package inspect uds-remote-agent 2>/dev/null; then
+            cd agent && uds zarf package deploy zarf-package-uds-remote-agent-$MARU_ARCH-$AGENT_VERSION.tar.zst --confirm
+          fi
+
+  - name: get-keycloak-admin-password
+    description: Get the password for the admin user in keycloak
+    actions:
+      - cmd: |
+          ./zarf tools kubectl get secret keycloak-admin-password -n keycloak -o jsonpath='{.data.password}' | base64 -d 
+          
+  - name: keycloak-admin-user
+    actions:
+      - description: Sets up the Keycloak admin user for dev/testing if not already created
+        cmd: |
+          # Check if the secret exists
+          if ./zarf tools kubectl get secret keycloak-admin-password -n keycloak > /dev/null 2>&1; then
+            echo "Admin user exists, skipping..."
+          else
+            # Start port-forward with zarf
+            ./zarf tools kubectl port-forward -n keycloak svc/keycloak-http 8080:8080 &
+            PF_PID=$!
+
+            # Wait a bit to ensure port-forward is ready
+            sleep 5
+
+            # Create admin user with curl
+            PASSWORD=$(openssl rand -base64 12)
+            STATE_COOKIE=$(curl --silent --output /dev/null --cookie-jar - http://localhost:8080/ | grep "WELCOME_STATE_CHECKER" | awk '{print $7}')
+            curl --silent --show-error http://localhost:8080/ \
+              -H "Cookie: WELCOME_STATE_CHECKER=${STATE_COOKIE}" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "username=admin" \
+              --data-urlencode "password=${PASSWORD}" \
+              --data-urlencode "passwordConfirmation=${PASSWORD}" \
+              --data-urlencode "stateChecker=${STATE_COOKIE}"
+
+            # Kill the port-forward
+            kill $PF_PID
+
+            ./zarf tools kubectl create secret generic keycloak-admin-password \
+              --from-literal=username=admin \
+              --from-literal=password=${PASSWORD} \
+              -n keycloak
+          fi
+
+  - name: setup-keycloak
+    actions:
+      - task: keycloak-admin-user
+      - task: create-doug-user 
+
+  - name: create-doug-user
+    description: Creates a user named 'doug' in the uds realm of keycloak (using the default admin account)
+    actions:
+      - description: Creating the 'doug' user in the 'uds' realm
+        cmd: |
+          KEYCLOAK_ADMIN_PASSWORD=$(./uds zarf tools kubectl get secret -n keycloak keycloak-admin-password -o jsonpath='{.data.password}' | base64 -d)
+          KEYCLOAK_ADMIN_TOKEN=$(curl -s --location "https://keycloak.admin.uds.dev/realms/master/protocol/openid-connect/token" \
+            --header "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "username=admin" \
+            --data-urlencode "password=${KEYCLOAK_ADMIN_PASSWORD}" \
+            --data-urlencode "client_id=admin-cli" \
+            --data-urlencode "grant_type=password" | ./uds zarf tools yq .access_token)
+
+          # Create the doug user in the UDS Realm
+          curl --location "https://keycloak.admin.uds.dev/admin/realms/uds/users" \
+          --header "Content-Type: application/json" \
+          --header "Authorization: Bearer ${KEYCLOAK_ADMIN_TOKEN}" \
+          --data-raw '{
+              "username": "Doug",
+              "firstName": "Doug",
+              "lastName": "Unicorn",
+              "email": "doug@uds.dev",
+              "attributes": {
+                "mattermostid": "1"
+              },
+              "emailVerified": true,
+              "enabled": true,
+              "requiredActions": [],
+              "credentials": [
+                {
+                  "type": "password",
+                  "value": "unicorn123!@#UN",
+                  "temporary": false
+                }
+              ]'"${KEYCLOAK_GROUP:+,
+              \"groups\": [
+                \"${KEYCLOAK_GROUP}\"
+              ]}"'
+          }'
+
+          # Disable 2FA
+          CONDITIONAL_OTP_ID=$(curl --location "https://keycloak.admin.uds.dev/admin/realms/uds/authentication/flows/Authentication/executions" \
+            --header "Authorization: Bearer ${KEYCLOAK_ADMIN_TOKEN}" | ./uds zarf tools yq '.[] | select(.displayName == "Conditional OTP") | .id')
+
+          curl --location --request PUT "https://keycloak.admin.uds.dev/admin/realms/uds/authentication/flows/Authentication/executions" \
+          --header "Content-Type: application/json" \
+          --header "Authorization: Bearer ${KEYCLOAK_ADMIN_TOKEN}" \
+          --data "{
+                  \"id\": \"${CONDITIONAL_OTP_ID}\",
+                  \"requirement\": \"DISABLED\"
+              }"
+
+  - name: create-diane-user
+    description: Creates a user named 'diane' in the uds realm of keycloak (using the default admin account)
+    actions:
+      - description: Creating the 'diane' user int he 'uds' realm
+        cmd: |
+          KEYCLOAK_ADMIN_PASSWORD=$(./uds zarf tools kubectl get secret -n keycloak keycloak-admin-password -o jsonpath='{.data.password}' | base64 -d)
+          KEYCLOAK_ADMIN_TOKEN=$(curl -s --location "https://keycloak.admin.uds.dev/realms/master/protocol/openid-connect/token" \
+            --header "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "username=admin" \
+            --data-urlencode "password=${KEYCLOAK_ADMIN_PASSWORD}" \
+            --data-urlencode "client_id=admin-cli" \
+            --data-urlencode "grant_type=password" | ./uds zarf tools yq .access_token)
+
+          # Create the doug user in the UDS Realm
+          curl --location "https://keycloak.admin.uds.dev/admin/realms/uds/users" \
+          --header "Content-Type: application/json" \
+          --header "Authorization: Bearer ${KEYCLOAK_ADMIN_TOKEN}" \
+          --data-raw '{
+              "username": "diane",
+              "firstName": "Diane",
+              "lastName": "Unicorn",
+              "email": "diane@uds.dev",
+              "attributes": {
+                "mattermostid": "2"
+              },
+              "emailVerified": true,
+              "enabled": true,
+              "requiredActions": [],
+              "credentials": [
+                {
+                  "type": "password",
+                  "value": "unicorn123!@#UN",
+                  "temporary": false
+                }
+              ]'"${KEYCLOAK_GROUP:+,
+              \"groups\": [
+                \"${KEYCLOAK_GROUP}\"
+              ]}"'
+          }'
+
+          # Disable 2FA
+          CONDITIONAL_OTP_ID=$(curl --location "https://keycloak.admin.uds.dev/admin/realms/uds/authentication/flows/Authentication/executions" \
+            --header "Authorization: Bearer ${KEYCLOAK_ADMIN_TOKEN}" | ./uds zarf tools yq '.[] | select(.displayName == "Conditional OTP") | .id')
+
+          curl --location --request PUT "https://keycloak.admin.uds.dev/admin/realms/uds/authentication/flows/Authentication/executions" \
+          --header "Content-Type: application/json" \
+          --header "Authorization: Bearer ${KEYCLOAK_ADMIN_TOKEN}" \
+          --data "{
+                  \"id\": \"${CONDITIONAL_OTP_ID}\",
+                  \"requirement\": \"DISABLED\"
+              }"
