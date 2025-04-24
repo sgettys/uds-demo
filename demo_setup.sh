@@ -17,6 +17,7 @@ else
   echo "Unsupported architecture: $ARCH"
   exit 1
 fi
+mkdir -p packages
 ZARF_INIT_PATH="$HOME/.zarf-cache/zarf-init-${ARCH}-${VERSION}.tar.zst"
 if [ ! -f "$ZARF_INIT_PATH" ]; then
   #echo "Zarf init package not found. Connect to the internet and run 'uds zarf tools download-init -o ~/.zarf-cache' to download the package."
