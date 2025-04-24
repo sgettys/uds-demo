@@ -18,10 +18,11 @@ else
   exit 1
 fi
 mkdir -p packages
+mkdir -p ~/.zarf-cache
 ZARF_INIT_PATH="$HOME/.zarf-cache/zarf-init-${ARCH}-${VERSION}.tar.zst"
 if [ ! -f "$ZARF_INIT_PATH" ]; then
   #echo "Zarf init package not found. Connect to the internet and run 'uds zarf tools download-init -o ~/.zarf-cache' to download the package."
-  uds zarf tools download-init
+  uds zarf tools download-init -o ~/.zarf-cache
 fi
 if uds zarf package inspect init > /dev/null 2>&1; then
   echo "Zarf is already initialized."
@@ -67,10 +68,10 @@ else
   echo "Installing metallb package"
   METALLB_PACKAGE_VERSION="0.1.2"
   METALLB_PACKAGE="zarf-package-metallb-${ARCH}-${METALLB_PACKAGE_VERSION}.tar.zst"
-  if [ ! -f "${METALLB_PACKAGE}" ]; then 
-    uds zarf package pull oci://ghcr.io/defenseunicorns/packages/metallb:${METALLB_PACKAGE_VERSION}
+  if [ ! -f "packages/${METALLB_PACKAGE}" ]; then 
+    uds zarf package pull oci://ghcr.io/defenseunicorns/packages/metallb:${METALLB_PACKAGE_VERSION} -o packages
   fi
-  uds zarf package deploy ${METALLB_PACKAGE} \
+  uds zarf package deploy packages/${METALLB_PACKAGE} \
     --set IP_ADDRESS_ADMIN_INGRESSGATEWAY="$ADMIN_INGRESS_IP" \
     --set IP_ADDRESS_TENANT_INGRESSGATEWAY="$TENANT_INGRESS_IP" \
     --set IP_ADDRESS_PASSTHROUGH_INGRESSGATEWAY="$PASSTHROUGH_INGRESS_IP" \
